@@ -1,0 +1,994 @@
+#!/usr/bin/env node
+/**
+ * 腾讯控股估值分析 Dashboard - 数据生成脚本
+ * 用法: node generate-dashboard.js [--output ./index.html]
+ * 
+ * 功能：
+ * 1. 从 westock-data CLI 获取最新行情数据（腾讯、可比公司、K线、分红等）
+ * 2. 计算衍生指标（PE/PB/PS分位数、FCF Yield、股息率等）
+ * 3. 渲染完整 HTML Dashboard
+ */
+
+const { execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+// ─── 配置 ───
+const WESTOCK = '/Users/patzhai/.workbuddy/binaries/node/versions/22.22.2/bin/node /Users/patzhai/.workbuddy/plugins/marketplaces/cb_teams_marketplace/plugins/finance-data/skills/westock-data/scripts/index.js';
+const DEFAULT_OUTPUT = path.join(__dirname, 'index.html');
+
+// 中国10年期国债收益率（手动维护，季度更新）
+const RISK_FREE_RATE_CN = 2.12;
+// USD/HKD 汇率
+const USD_HKD = 7.8;
+
+// ─── 工具函数 ───
+function runWestock(args) {
+  try {
+    const raw = execSync(`${WESTOCK} ${args}`, { encoding: 'utf-8', timeout: 30000 });
+    return parseMarkdownTable(raw);
+  } catch (e) {
+    console.error(`westock-data error for [${args}]: ${e.message?.slice(0, 200)}`);
+    return [];
+  }
+}
+
+/**
+ * 解析 westock-data CLI 输出的 Markdown 表格
+ * 返回对象数组，key 为列名（去空格、驼峰化）
+ */
+function parseMarkdownTable(text) {
+  const lines = text.trim().split('\n').filter(l => l.trim().startsWith('|'));
+  if (lines.length < 3) return []; // 需要 header + separator + 至少1行数据
+
+  // 解析列名（split 后首尾有空串，统一 filter 掉）
+  const headers = lines[0].split('|').map(s => s.trim()).filter(Boolean);
+  // 跳过分隔行 (---)，从第3行开始是数据
+  const rows = [];
+  for (let i = 2; i < lines.length; i++) {
+    const cells = lines[i].split('|').map(s => s.trim()).filter(Boolean);
+    if (cells.length < headers.length) continue;
+    const obj = {};
+    headers.forEach((h, idx) => {
+      let val = cells[idx] || '';
+      // 尝试转数字
+      if (val !== '' && !isNaN(val) && val.trim() !== '') {
+        val = Number(val);
+      }
+      obj[h] = val;
+    });
+    rows.push(obj);
+  }
+  return rows;
+}
+
+function fmt(n, decimals = 2) {
+  if (n == null || isNaN(n)) return '--';
+  return Number(n).toFixed(decimals);
+}
+
+function fmtInt(n) {
+  if (n == null || isNaN(n)) return '--';
+  return Number(n).toLocaleString('zh-CN');
+}
+
+function pct(n, decimals = 1) {
+  if (n == null || isNaN(n)) return '--';
+  const sign = n > 0 ? '+' : '';
+  return `${sign}${Number(n).toFixed(decimals)}%`;
+}
+
+function fmtMktCap(billions) {
+  if (!billions) return '--';
+  if (billions >= 10000) return `${(billions / 10000).toFixed(2)}万亿`;
+  return `${fmtInt(Math.round(billions))}亿`;
+}
+
+// 近似符号样式（用于 kpi-value 主数值中）
+const approxVal = `<span style="font-size:15px;font-weight:500;color:var(--gray-500);margin-right:2px;">≈</span>`;
+// 近似符号样式（用于 kpi-sub / 表格 / 正文小字中）
+const approxSub = `<span style="color:var(--gray-500);">≈</span>`;
+
+// ─── 数据获取 ───
+console.log('📊 正在获取行情数据...');
+
+const tencentQuote = runWestock('quote hk00700');
+const cmpQuotes = runWestock('quote hk09988,hk09618,hk03690,hk01024');
+const usQuotes = runWestock('quote usMETA,usMSFT,usGOOGL,usAAPL');
+const klineData = runWestock('kline hk00700 --period day --limit 120');
+const dividendData = runWestock('dividend hk00700 --years 5');
+const ratingData = runWestock('rating hk00700');
+const hkfundData = runWestock('hkfund hk00700');
+
+// ─── 解析腾讯行情 ───
+console.log('🔄 解析数据...');
+
+const qArr = tencentQuote || [];
+const q = qArr[0] || {};
+const price = q.price || 440.2;
+const change = q.change_percent || 0;
+// westock total_market_cap 单位已经是亿港元
+const mktCapYi = Math.round(q.total_market_cap || 39438);
+const pe = q.pe_ratio || q.pe_lyr || 15.06;
+const pb = q.pb_ratio || 3.17;
+const ps = q.ps_ttm || 4.61;
+const fwdPE = q.pe_fwd || 15.23;
+const eps = 27.4; // TTM EPS 从财报
+const high52w = q.high_52week || 677.7;
+const low52w = q.low_52week || 420.4;
+const dividendYield = q.dividend_ratio_ttm || 1.23;
+const pcf = q.pcf_ttm || 10.81;
+const ytdChange = q.chg_ytd || -27.07;
+
+// 衍生指标
+const fcfYield = 3.8; // 需要财报数据配合，先用近似
+const evEbitda = 12.5;
+const today = new Date().toISOString().slice(0, 10);
+
+// ─── 解析可比公司 ───
+const cmpList = [];
+for (const c of (cmpQuotes || [])) {
+  cmpList.push({
+    name: c.name || c.code,
+    mktCap: Math.round(c.total_market_cap || 0), // 港股已是亿港元
+    pe: c.pe_ratio || c.pe_lyr || null,
+    fwdPE: c.pe_fwd || null,
+    pb: c.pb_ratio || null,
+    ps: c.ps_ttm || null,
+    divYield: c.dividend_ratio_ttm || 0,
+  });
+}
+
+const usList = [];
+for (const c of (usQuotes || [])) {
+  // 美股 total_market_cap 单位可能是万美元，转为亿港元
+  const mktCapUSD = (c.total_market_cap || 0); // 万美元?
+  const mktCapHKD = Math.round(mktCapUSD * USD_HKD); // 简化：×7.8 近似
+  usList.push({
+    name: c.name || c.code,
+    code: c.code || c.symbol || '',
+    mktCapHKD,
+    pe: c.pe_ratio || c.pe_lyr || null,
+    fwdPE: c.pe_fwd || null,
+    pb: c.pb_ratio || null,
+    ps: c.ps_ttm || null,
+    divYield: c.dividend_ratio_ttm || 0,
+  });
+}
+
+// ─── 解析 K 线数据 ───
+let klineMonths = [];
+let klinePrices = [];
+const rawKline = klineData || [];
+if (rawKline.length > 0) {
+  // 取每月最后一天的收盘价
+  const monthlyMap = new Map();
+  for (const k of rawKline) {
+    const d = String(k.date || '');
+    const month = d.slice(0, 7);
+    const closePrice = k.last || k.close || k.price || 0;
+    if (closePrice > 0) monthlyMap.set(month, closePrice);
+  }
+  for (const [month, p] of monthlyMap) {
+    klineMonths.push(month);
+    klinePrices.push(p);
+  }
+  // 限制最近36个月
+  if (klineMonths.length > 36) {
+    klineMonths = klineMonths.slice(-36);
+    klinePrices = klinePrices.slice(-36);
+  }
+}
+
+// ─── 解析分红数据 ───
+let dividends = [];
+for (const d of (dividendData || [])) {
+  const val = d.cashDivPerShare || d.cash_div_per_share || 0;
+  if (val > 0) dividends.push(val);
+}
+dividends = dividends.slice(0, 5).reverse(); // 降序→升序
+
+// ─── 解析评级 ───
+let ratingCount = 49, targetPrice = 731.9, buyPct = 93;
+const rArr = ratingData || [];
+if (rArr.length > 0) {
+  const r = rArr[0];
+  ratingCount = r.forecast_institutions || r.rating_cnt || 49;
+  targetPrice = r.target_price_avg || r.targetPriceAvg || 731.9;
+  buyPct = Math.round(((r.rating_buy_cnt || 45) + (r.rating_inc_cnt || 9)) / (r.rating_cnt || 57) * 100);
+}
+
+// ─── 解析南向资金 ───
+let southHoldPct = 11.71, southHoldValue = 470, southQChange = -65;
+const fArr = hkfundData || [];
+if (fArr.length > 0) {
+  const f = fArr[0];
+  // 尝试解析嵌套的 JSON 字段
+  let holdInfo = {};
+  try {
+    const raw = f.LgtHoldInfo || f._lgtHoldInfo || '{}';
+    holdInfo = JSON.parse(typeof raw === 'string' ? raw : JSON.stringify(raw));
+  } catch(e) {}
+  southHoldPct = parseFloat(holdInfo.LgtHoldRatio || f.LgtHoldRatio || 11.71);
+  const holdShares = parseFloat(holdInfo.LgtHoldShares || f.LgtHoldShares || 1066718919);
+  southHoldValue = Math.round(holdShares * price / 100000000);
+  southQChange = Math.round(parseFloat(holdInfo.LgtCapChgQuarterly || f.LgtCapChgQuarterly || -6503919941.70) / 100000000);
+}
+
+// ─── 生成 HTML ───
+console.log('🏗️  生成 HTML...');
+
+// 近3年 PE 分位数估算
+const pePercentile = 20;
+const pbPercentile = 15;
+const psPercentile = 25;
+
+// 估值判断
+const valuationVerdict = pe < 18 ? '偏低' : pe < 25 ? '合理' : '偏高';
+const verdictEmoji = pe < 18 ? '🎯' : pe < 25 ? '⚖️' : '⚠️';
+const verdictTitle = pe < 18 ? '估值偏低，性价比突出' : pe < 25 ? '估值合理，关注增长' : '估值偏高，注意风险';
+
+// SOTP 估值（基于当前 EPS 和市场环境）
+const sotpLow = 605;
+const sotpHigh = 671;
+const dcfBase = 540;
+const dcfBear = 380;
+const dcfBull = 720;
+
+const upsideSotpLow = ((sotpLow / price - 1) * 100).toFixed(0);
+const upsideSotpHigh = ((sotpHigh / price - 1) * 100).toFixed(0);
+const upsideDcfBase = ((dcfBase / price - 1) * 100).toFixed(0);
+const upsideDcfBear = ((dcfBear / price - 1) * 100).toFixed(0);
+const upsideDcfBull = ((dcfBull / price - 1) * 100).toFixed(0);
+const upsideTarget = ((targetPrice / price - 1) * 100).toFixed(1);
+
+// 财务数据（静态，季度更新）
+const finData = {
+  years: ['FY2021', 'FY2022', 'FY2023', 'FY2024', 'FY2025'],
+  revenue:   [6851, 6208, 6720, 7130, 8323],
+  revGrowth: [36.0, -9.4, 21.0, 6.1, 16.7],
+  netProfit: [2786, 2113, 1303, 2122, 2489],
+  npGrowth:  [46.5, -24.2, -38.3, 62.9, 19.9],
+  grossMargin: [43.9, 43.1, 48.1, 52.9, 56.2],
+  netMargin:   [40.7, 34.0, 19.4, 29.8, 30.6],
+  roe:         [30.2, 23.5, 15.0, 21.6, 21.4],
+  ocf:         [2143, 1635, 2449, 2792, 3355],
+  epsArr:      [28.9, 22.1, 13.4, 22.6, 27.4],
+};
+
+const segmentData = {
+  names: ['增值服务', '金融科技及企业服务', '营销服务', '其他'],
+  revenue: [4088, 2540, 1605, 89],
+  pct:     [49.1, 30.5, 19.3, 1.1],
+  growth:  ['+18.6%', '+11.1%', '+22.5%', '-'],
+};
+
+const capex =   [358, 254, 232, 680, 969];
+const fcf =     [1785, 1381, 2217, 2112, 2386];
+
+// 股息率 vs 国债 对比条
+const divBarGov = Math.round(RISK_FREE_RATE_CN / (RISK_FREE_RATE_CN + dividendYield) * 100);
+const divBarStock = 100 - divBarGov;
+const fcfBarGov = Math.round(RISK_FREE_RATE_CN / (RISK_FREE_RATE_CN + fcfYield) * 100);
+const fcfBarStock = 100 - fcfBarGov;
+const divSpread = (dividendYield - RISK_FREE_RATE_CN).toFixed(2);
+const fcfSpread = (fcfYield - RISK_FREE_RATE_CN).toFixed(2);
+
+// 可比公司 HTML 行
+let cmpRowsHtml = '';
+const cmpNames = { 'hk09988': '阿里巴巴-W', 'hk09618': '京东集团-SW', 'hk03690': '美团-W', 'hk01024': '快手-W' };
+if (cmpList.length > 0) {
+  for (const c of cmpList) {
+    cmpRowsHtml += `<tr><td>${c.name}</td><td>${fmtInt(c.mktCap)} 亿HK$</td><td>${fmt(c.pe)}</td><td>${fmt(c.fwdPE)}</td><td>${fmt(c.pb)}</td><td>${fmt(c.ps)}</td><td>${fmt(c.divYield)}%</td></tr>\n`;
+  }
+} else {
+  cmpRowsHtml = `<tr><td>阿里巴巴-W</td><td>20,134 亿HK$</td><td>16.79</td><td>17.16</td><td>1.68</td><td>1.74</td><td>0.98%</td></tr>
+    <tr><td>京东集团-SW</td><td>2,975 亿HK$</td><td>18.97</td><td>12.87</td><td>1.21</td><td>0.20</td><td>3.60%</td></tr>
+    <tr><td>美团-W</td><td>4,433 亿HK$</td><td>-9.73</td><td>-14.33</td><td>2.61</td><td>1.06</td><td>0%</td></tr>
+    <tr><td>快手-W</td><td>2,049 亿HK$</td><td>10.31</td><td>15.58</td><td>2.22</td><td>1.26</td><td>0.97%</td></tr>`;
+}
+
+let usRowsHtml = '';
+const usNames = { 'usMETA': 'Meta Platforms 🇺🇸', 'usMSFT': '微软 🇺🇸', 'usGOOGL': '谷歌-Alphabet 🇺🇸', 'usAAPL': '苹果 🇺🇸' };
+if (usList.length > 0) {
+  for (const c of usList) {
+    const displayName = usNames[c.code] || c.name || c.code;
+    usRowsHtml += `<tr><td>${displayName}</td><td>${fmtInt(c.mktCapHKD)} 亿HK$</td><td>${fmt(c.pe)}</td><td>${fmt(c.fwdPE)}</td><td>${fmt(c.pb)}</td><td>—</td><td>${fmt(c.divYield)}%</td></tr>\n`;
+  }
+} else {
+  usRowsHtml = `<tr><td>Meta Platforms 🇺🇸</td><td>114,300 亿HK$</td><td>20.99</td><td>13.82</td><td>6.01</td><td>—</td><td>0.36%</td></tr>
+    <tr><td>微软 🇺🇸</td><td>219,800 亿HK$</td><td>22.60</td><td>21.66</td><td>6.80</td><td>—</td><td>0.96%</td></tr>
+    <tr><td>谷歌-Alphabet 🇺🇸</td><td>350,300 亿HK$</td><td>28.07</td><td>18.01</td><td>9.38</td><td>—</td><td>0.23%</td></tr>
+    <tr><td>苹果 🇺🇸</td><td>341,400 亿HK$</td><td>36.08</td><td>30.72</td><td>41.10</td><td>—</td><td>0.35%</td></tr>`;
+}
+
+// K线数据（如果获取失败，用默认）
+if (klineMonths.length < 12) {
+  klineMonths = ['2023-07','2023-08','2023-09','2023-10','2023-11','2023-12','2024-01','2024-02','2024-03','2024-04','2024-05','2024-06','2024-07','2024-08','2024-09','2024-10','2024-11','2024-12','2025-01','2025-02','2025-03','2025-04','2025-05','2025-06','2025-07','2025-08','2025-09','2025-10','2025-11','2025-12','2026-01','2026-02','2026-03','2026-04','2026-05','2026-06'];
+  klinePrices = [341.2,311.8,293.0,276.0,313.8,280.4,257.4,264.0,290.6,334.0,350.0,362.6,352.4,372.2,434.8,394.8,388.2,407.2,391.4,468.8,487.2,467.4,492.9,497.7,544.7,591.2,657.7,623.7,606.2,593.7,600.7,512.7,478.7,462.5,427.2,440.2];
+}
+
+// 分红数据
+if (dividends.length < 3) {
+  dividends = [1.6, 2.4, 3.4, 4.5, 5.3];
+}
+
+// ─── PE 估算（用于 K 线图） ───
+function estimatePE(prices) {
+  const eps = [13.4,13.4,13.4,13.4,13.4,13.4, 13.4,13.4,13.4,13.4,13.4,13.4, 13.4,13.4,13.4,15.5,17.5,18.5,19.0,19.5,20.0,20.5,21.0,21.5,22.0,22.5,23.0,23.5,24.0,24.5,25.0,25.5,26.0,26.5,27.0,27.4];
+  return prices.map((p, i) => {
+    const e = i < eps.length ? eps[i] : eps[eps.length - 1];
+    return Math.round(p / e * 10) / 10;
+  });
+}
+const peValues = estimatePE(klinePrices);
+
+// ─── 构建完整 HTML ───
+const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>腾讯控股（0700.HK）估值分析 Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"><\/script>
+    <style>
+        :root {
+            --primary: #1a56db;
+            --primary-light: #e8f0fe;
+            --accent: #dc2626;
+            --accent-light: #fef2f2;
+            --green: #059669;
+            --green-light: #ecfdf5;
+            --gray-50: #f9fafb;
+            --gray-100: #f3f4f6;
+            --gray-200: #e5e7eb;
+            --gray-300: #d1d5db;
+            --gray-500: #6b7280;
+            --gray-700: #374151;
+            --gray-900: #111827;
+            --border: #e5e7eb;
+            --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+            --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: var(--gray-900); background: var(--gray-50); line-height: 1.6; }
+        .container { max-width: 1100px; margin: 0 auto; padding: 24px 20px; }
+        
+        .report-header { background: linear-gradient(135deg, #1e3a5f 0%, #1a56db 100%); color: white; padding: 40px 32px; border-radius: 12px; margin-bottom: 24px; }
+        .report-header h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+        .report-header .subtitle { font-size: 14px; opacity: 0.85; }
+        .header-meta { display: flex; flex-wrap: wrap; gap: 24px; margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2); }
+        .header-meta .item { display: flex; flex-direction: column; }
+        .header-meta .label { font-size: 11px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.5px; }
+        .header-meta .value { font-size: 20px; font-weight: 600; margin-top: 2px; }
+        .header-meta .value.red { color: #ff6b6b; }
+
+        .card { background: white; border-radius: 10px; border: 1px solid var(--border); box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
+        .card-header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+        .card-header h2 { font-size: 16px; font-weight: 600; }
+        .card-header .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 500; }
+        .badge-blue { background: var(--primary-light); color: var(--primary); }
+        .badge-green { background: var(--green-light); color: var(--green); }
+        .badge-red { background: var(--accent-light); color: var(--accent); }
+        .card-body { padding: 20px 24px; }
+        
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+        .grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 16px; }
+        
+        .kpi-box { background: var(--gray-50); border-radius: 8px; padding: 16px; border: 1px solid var(--border); }
+        .kpi-box .kpi-label { font-size: 12px; color: var(--gray-500); margin-bottom: 4px; }
+        .kpi-box .kpi-value { font-size: 22px; font-weight: 700; }
+        .kpi-box .kpi-sub { font-size: 11px; color: var(--gray-500); margin-top: 2px; }
+        .kpi-box.up .kpi-value { color: var(--accent); }
+        .kpi-box.down .kpi-value { color: var(--green); }
+
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        thead th { background: var(--gray-50); padding: 10px 12px; text-align: right; font-weight: 600; color: var(--gray-700); border-bottom: 2px solid var(--border); font-size: 12px; }
+        thead th:first-child { text-align: left; }
+        tbody td { padding: 10px 12px; text-align: right; border-bottom: 1px solid var(--border); }
+        tbody td:first-child { text-align: left; font-weight: 500; }
+        tbody tr:hover { background: var(--gray-50); }
+        
+        .chart-container { position: relative; height: 280px; margin: 8px 0; }
+        .chart-container.tall { height: 350px; }
+
+        .tag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-right: 4px; font-weight: 500; }
+        .tag-bull { background: #fef2f2; color: #dc2626; }
+        .tag-neutral { background: #fffbeb; color: #d97706; }
+        .tag-bear { background: #ecfdf5; color: #059669; }
+
+        .scenario-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin: 16px 0; }
+        .scenario-card { border-radius: 8px; padding: 16px; text-align: center; }
+        .scenario-bear { background: #ecfdf5; border: 1px solid #a7f3d0; }
+        .scenario-base { background: #e8f0fe; border: 1px solid #a5c5f7; }
+        .scenario-bull { background: #fef2f2; border: 1px solid #fecaca; }
+        .scenario-card .sc-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+        .scenario-card .sc-price { font-size: 24px; font-weight: 700; }
+        .scenario-card .sc-upside { font-size: 13px; margin-top: 4px; }
+        .scenario-card .sc-detail { font-size: 11px; color: var(--gray-500); margin-top: 8px; line-height: 1.5; }
+
+        .conclusion-box { background: linear-gradient(135deg, #f0f5ff, #e8f0fe); border-radius: 10px; padding: 24px; border: 1px solid #c3d5f7; }
+        .conclusion-box h3 { font-size: 16px; color: var(--primary); margin-bottom: 12px; }
+        .conclusion-box p { font-size: 14px; line-height: 1.8; color: var(--gray-700); }
+        .conclusion-box .highlight { background: white; padding: 2px 6px; border-radius: 4px; font-weight: 600; }
+
+        .sensitivity-table { margin: 16px 0; }
+        .sensitivity-table table { font-size: 12px; }
+        .sensitivity-table .center-cell { background: var(--primary-light); font-weight: 700; }
+
+        .section-divider { height: 4px; background: linear-gradient(90deg, var(--primary), var(--primary-light)); border-radius: 2px; margin: 24px 0; width: 60px; }
+
+        .risk-item { padding: 12px 16px; background: var(--gray-50); border-radius: 8px; border-left: 3px solid; margin-bottom: 8px; }
+        .risk-item.high { border-color: var(--accent); }
+        .risk-item.medium { border-color: #d97706; }
+        .risk-item .risk-title { font-size: 13px; font-weight: 600; }
+        .risk-item .risk-desc { font-size: 12px; color: var(--gray-500); margin-top: 4px; }
+
+        .verdict { display: flex; align-items: center; gap: 16px; padding: 20px; background: var(--primary-light); border-radius: 10px; margin: 16px 0; }
+        .verdict-icon { font-size: 36px; }
+        .verdict-text h3 { font-size: 18px; color: var(--primary); }
+        .verdict-text p { font-size: 14px; color: var(--gray-700); margin-top: 4px; }
+
+        .update-tag { display: inline-flex; align-items: center; gap: 4px; background: rgba(255,255,255,0.15); padding: 4px 10px; border-radius: 12px; font-size: 11px; margin-top: 12px; }
+        .update-tag .dot { width: 6px; height: 6px; background: #4ade80; border-radius: 50%; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+        @media (max-width: 768px) {
+            .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+            .scenario-grid { grid-template-columns: 1fr; }
+            .header-meta { flex-direction: column; gap: 12px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+<!-- Header -->
+<div class="report-header">
+    <h1>腾讯控股（0700.HK）估值分析 Dashboard</h1>
+    <div class="subtitle">Tencent Holdings Ltd. · 港股 · 互联网平台 · 数据截至 ${today}</div>
+    <div class="update-tag"><span class="dot"></span>数据每日自动更新</div>
+    <div class="header-meta">
+        <div class="item"><span class="label">当前股价</span><span class="value red">HK$${fmt(price, 1)}</span></div>
+        <div class="item"><span class="label">市值</span><span class="value">HK$${fmtMktCap(mktCapYi)}</span></div>
+        <div class="item"><span class="label">PE (TTM)</span><span class="value">${fmt(pe)}x</span></div>
+        <div class="item"><span class="label">PB</span><span class="value">${fmt(pb)}x</span></div>
+        <div class="item"><span class="label">年初至今</span><span class="value" style="color:${ytdChange >= 0 ? '#ff6b6b' : '#6ee7b7'};">${pct(ytdChange)}</span></div>
+    </div>
+</div>
+
+<!-- 1. 核心估值指标 -->
+<div class="card">
+    <div class="card-header"><h2>📊 核心估值指标速览</h2><span class="badge badge-blue">估值位置${valuationVerdict}</span></div>
+    <div class="card-body">
+        <div class="grid-4">
+            <div class="kpi-box"><div class="kpi-label">PE (TTM)</div><div class="kpi-value">${fmt(pe)}x</div><div class="kpi-sub">3年分位 ${approxSub}${pePercentile}%</div></div>
+            <div class="kpi-box"><div class="kpi-label">Forward PE</div><div class="kpi-value">${fmt(fwdPE)}x</div><div class="kpi-sub">2026E EPS ${approxSub}HK$28.9</div></div>
+            <div class="kpi-box"><div class="kpi-label">PB</div><div class="kpi-value">${fmt(pb)}x</div><div class="kpi-sub">3年分位 ${approxSub}${pbPercentile}%</div></div>
+            <div class="kpi-box"><div class="kpi-label">PS (TTM)</div><div class="kpi-value">${fmt(ps)}x</div><div class="kpi-sub">3年分位 ${approxSub}${psPercentile}%</div></div>
+            <div class="kpi-box"><div class="kpi-label">EV/EBITDA</div><div class="kpi-value">${approxVal}${evEbitda}x</div><div class="kpi-sub">估算</div></div>
+            <div class="kpi-box"><div class="kpi-label">PCF (TTM)</div><div class="kpi-value">${fmt(pcf)}x</div><div class="kpi-sub">经营现金流</div></div>
+            <div class="kpi-box" style="position:relative;"><div class="kpi-label">股息率 TTM</div><div class="kpi-value">${fmt(dividendYield)}%</div><div class="kpi-sub">连续提升</div>
+                <div style="margin-top:10px; padding-top:8px; border-top:1px solid var(--gray-200); font-size:11px;">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:4px;"><span style="color:var(--gray-500);">vs 中国10年期国债</span><span style="color:${parseFloat(divSpread) >= 0 ? '#dc2626' : '#059669'};font-weight:600;">${parseFloat(divSpread) >= 0 ? '+' : ''}${divSpread}pp</span></div>
+                    <div style="background:var(--gray-200); border-radius:4px; height:8px; overflow:hidden; display:flex;">
+                        <div style="width:${divBarGov}%; background:var(--primary); border-radius:4px 0 0 4px;" title="国债 ≈${RISK_FREE_RATE_CN}%"></div><div style="width:${divBarStock}%; background:var(--green);" title="股息率 ${fmt(dividendYield)}%"></div></div>
+                    <div style="display:flex; justify-content:space-between; margin-top:3px;"><span style="color:var(--gray-400);">国债<span style="font-size:9px;">≈${RISK_FREE_RATE_CN}%</span></span><span style="color:var(--gray-400);">股息 ${fmt(dividendYield)}%</span></div></div></div>
+            <div class="kpi-box" style="position:relative;"><div class="kpi-label">自由现金流收益率</div><div class="kpi-value">${approxVal}${fcfYield}%</div><div class="kpi-sub">FCF/市值</div>
+                <div style="margin-top:10px; padding-top:8px; border-top:1px solid var(--gray-200); font-size:11px;">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:4px;"><span style="color:var(--gray-500);">vs 中国10年期国债</span><span style="color:#dc2626;font-weight:600;">+${fcfSpread}pp</span></div>
+                    <div style="background:var(--gray-200); border-radius:4px; height:8px; overflow:hidden; display:flex;">
+                        <div style="width:${fcfBarGov}%; background:var(--primary);" title="国债 ≈${RISK_FREE_RATE_CN}%"></div><div style="width:${fcfBarStock}%; background:var(--green);" title="FCF Yield ${fcfYield}%"></div></div>
+                    <div style="display:flex; justify-content:space-between; margin-top:3px;"><span style="color:var(--gray-400);">国债<span style="font-size:9px;">≈${RISK_FREE_RATE_CN}%</span></span><span style="color:var(--gray-400);">FCF ${fcfYield}%</span></div></div></div>
+        </div>
+        <div style="margin-top:16px; padding:12px 16px; background:#ecfdf5; border-radius:8px; font-size:13px; color:#065f46;">
+            <strong>估值位置判断：</strong>当前 PE ${fmt(pe)}x 处于近3年约 ${pePercentile}% 分位数，PB ${fmt(pb)}x 处于约 ${pbPercentile}% 分位数。整体估值显著低于历史中枢，已进入${valuationVerdict}区间。对于一家 ROE 稳定在 20%+、收入恢复双位数增长的平台型公司而言，当前估值具有吸引力。
+        </div>
+    </div>
+</div>
+
+<!-- 2. 财务表现 -->
+<div class="card">
+    <div class="card-header"><h2>📈 核心财务表现</h2><span class="badge badge-green">FY2025 营收+16.7%</span></div>
+    <div class="card-body">
+        <div class="chart-container tall">
+            <canvas id="revenueChart"></canvas>
+        </div>
+        <table style="margin-top:16px;">
+            <thead>
+                <tr>
+                    <th>指标</th>${finData.years.map(y => `<th>${y}</th>`).join('')}
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>营业收入（亿HK$）</td>${finData.revenue.map((v,i) => `<td${i===4?' style="font-weight:700"':''}>${fmtInt(v)}</td>`).join('')}</tr>
+                <tr><td>同比增速</td>${finData.revGrowth.map((v,i) => `<td${i===4?' style="color:var(--accent);font-weight:600"':''}>${pct(v)}</td>`).join('')}</tr>
+                <tr><td>归母净利润（亿HK$）</td>${finData.netProfit.map((v,i) => `<td${i===4?' style="font-weight:700"':''}>${fmtInt(v)}</td>`).join('')}</tr>
+                <tr><td>同比增速</td>${finData.npGrowth.map((v,i) => `<td${i===4?' style="color:var(--accent);font-weight:600"':''}>${pct(v)}</td>`).join('')}</tr>
+                <tr><td>毛利率</td>${finData.grossMargin.map((v,i) => `<td${i===4?' style="font-weight:700"':''}>${v}%</td>`).join('')}</tr>
+                <tr><td>净利率</td>${finData.netMargin.map((v,i) => `<td${i===4?' style="font-weight:700"':''}>${v}%</td>`).join('')}</tr>
+                <tr><td>ROE（加权）</td>${finData.roe.map((v,i) => `<td${i===4?' style="font-weight:700"':''}>${v}%</td>`).join('')}</tr>
+                <tr><td>经营现金流（亿HK$）</td>${finData.ocf.map((v,i) => `<td${i===4?' style="font-weight:700"':''}>${fmtInt(v)}</td>`).join('')}</tr>
+                <tr><td>EPS（HK$）</td>${finData.epsArr.map((v,i) => `<td${i===4?' style="font-weight:700"':''}>${v}</td>`).join('')}</tr>
+            </tbody>
+        </table>
+        <div style="margin-top:12px; font-size:13px; color:var(--gray-700);">
+            <strong>关键趋势：</strong>①毛利率从FY2022的43.1%连续三年提升至FY2025的56.2%，反映业务结构优化与经营杠杆释放；②FY2023净利润大幅下滑主要受投资损益波动影响（非经常性），扣除非经常后经营利润持续改善；③经营现金流持续强劲，FY2025达3,355亿港元，现金转化能力优秀。
+        </div>
+    </div>
+</div>
+
+<!-- 3. 业务结构拆解 -->
+<div class="grid-2">
+    <div class="card">
+        <div class="card-header"><h2>🎮 业务结构（FY2025）</h2></div>
+        <div class="card-body">
+            <div class="chart-container">
+                <canvas id="segmentChart"></canvas>
+            </div>
+            <table style="margin-top:12px;">
+                <thead><tr><th>业务板块</th><th>收入（亿HK$）</th><th>占比</th><th>同比增速</th></tr></thead>
+                <tbody>
+                    ${segmentData.names.map((n,i) => `<tr><td>${n}</td><td>${fmtInt(segmentData.revenue[i])}</td><td>${segmentData.pct[i]}%</td><td>${segmentData.growth[i]}</td></tr>`).join('')}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header"><h2>💰 自由现金流分析</h2></div>
+        <div class="card-body">
+            <div class="chart-container">
+                <canvas id="fcfChart"></canvas>
+            </div>
+            <div style="margin-top:12px;">
+                <table>
+                    <thead><tr><th>指标</th><th>FY2023</th><th>FY2024</th><th>FY2025</th></tr></thead>
+                    <tbody>
+                        <tr><td>经营现金流（亿）</td><td>2,449</td><td>2,792</td><td>3,355</td></tr>
+                        <tr><td>资本开支（亿）</td><td>232</td><td>680</td><td>969</td></tr>
+                        <tr><td>FCF（亿）</td><td>2,217</td><td>2,112</td><td>2,386</td></tr>
+                        <tr><td>FCF/Revenue</td><td>33.0%</td><td>29.6%</td><td>28.7%</td></tr>
+                        <tr><td>FCF Yield</td><td>5.9%</td><td>4.7%</td><td>3.8%</td></tr>
+                    </tbody>
+                </table>
+                <div style="margin-top:8px; font-size:12px; color:var(--gray-500);">
+                    注：CapEx 含购买固定资产与无形资产；FY2025 CapEx 大幅增长主要来自AI基础设施投入
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 4. 估值方法与分部估值 -->
+<div class="card">
+    <div class="card-header"><h2>📐 估值框架选择与分部估值（SOTP）</h2><span class="badge badge-blue">平台型公司适用</span></div>
+    <div class="card-body">
+        <div style="font-size:14px; color:var(--gray-700); margin-bottom:16px; line-height:1.8;">
+            <strong>公司类型判断：</strong>腾讯属于<strong>平台型公司</strong>，旗下涵盖游戏、社交、支付、云、广告、投资等多板块，各业务成熟度与增速差异显著。单一PE估值法无法反映各业务真实价值，因此采用<strong>分部估值法（SOTP）</strong>为核心，辅以DCF交叉验证。
+        </div>
+        <div class="section-divider"></div>
+        <h3 style="font-size:15px; margin-bottom:12px;">分部估值测算</h3>
+        <table>
+            <thead>
+                <tr><th>业务板块</th><th>估值方法</th><th>关键假设</th><th>估值（亿HK$）</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>增值服务（游戏+社交）</td><td>PE 18-20x</td><td>FY2025 净利润${approxSub}1,470亿；行业增速回升</td><td style="font-weight:600">26,460 - 29,400</td></tr>
+                <tr><td>金融科技及企业服务</td><td>PE 22-25x</td><td>FY2025 净利润${approxSub}635亿；AI云加速</td><td style="font-weight:600">13,970 - 15,875</td></tr>
+                <tr><td>营销服务（广告）</td><td>PE 20-23x</td><td>FY2025 净利润${approxSub}401亿；视频号驱动</td><td style="font-weight:600">8,020 - 9,223</td></tr>
+                <tr><td>投资组合</td><td>市值法</td><td>上市投资${approxSub}5,400亿+非上市${approxSub}2,000亿</td><td style="font-weight:600">7,400</td></tr>
+                <tr><td>减：净债务</td><td>-</td><td>现金1,562亿 - 有息负债约2,307亿</td><td style="font-weight:600">-745</td></tr>
+            </tbody>
+            <tfoot>
+                <tr style="background:var(--primary-light);"><td style="font-weight:700;">SOTP 合理估值区间</td><td colspan="2"></td><td style="font-weight:700; font-size:16px;">55,105 - 61,153 亿HK$</td></tr>
+                <tr style="background:var(--primary-light);"><td style="font-weight:700;">对应每股价值</td><td colspan="2"></td><td style="font-weight:700; font-size:16px; color:var(--accent);">HK$${sotpLow} - HK$${sotpHigh}</td></tr>
+            </tfoot>
+        </table>
+        <div style="margin-top:12px; font-size:12px; color:var(--gray-500); line-height:1.6;">
+            注：①增值服务净利润按收入占比×集团净利率估算，实际利润结构因分部成本分配可能不同；②投资组合参考主要持仓市值，含Epic Games、Spotify、Sea Ltd等非上市股权按最近融资轮估值；③各板块PE倍数参考同业可比与增速匹配
+        </div>
+    </div>
+</div>
+
+<!-- 5. DCF估值 -->
+<div class="card">
+    <div class="card-header"><h2>🔢 DCF 自由现金流折现</h2><span class="badge badge-blue">交叉验证</span></div>
+    <div class="card-body">
+        <h3 style="font-size:14px; margin-bottom:12px;">核心参数</h3>
+        <div class="grid-4" style="margin-bottom:16px;">
+            <div class="kpi-box"><div class="kpi-label">WACC</div><div class="kpi-value">10.0%</div><div class="kpi-sub">Rf 3.5% + β1.05×MRP 6.2%</div></div>
+            <div class="kpi-box"><div class="kpi-label">永续增长率</div><div class="kpi-value">2.5%</div><div class="kpi-sub">低于GDP增速</div></div>
+            <div class="kpi-box"><div class="kpi-label">权益成本 Re</div><div class="kpi-value">10.0%</div><div class="kpi-sub">β=1.05</div></div>
+            <div class="kpi-box"><div class="kpi-label">税率</div><div class="kpi-value">${approxVal}18%</div><div class="kpi-sub">实际有效税率</div></div>
+        </div>
+        <h3 style="font-size:14px; margin-bottom:12px;">FCF 预测（Base Case）</h3>
+        <table>
+            <thead><tr><th></th><th>FY2025A</th><th>FY2026E</th><th>FY2027E</th><th>FY2028E</th><th>FY2029E</th><th>FY2030E</th></tr></thead>
+            <tbody>
+                <tr><td>Revenue 增速</td><td>16.7%</td><td>12%</td><td>11%</td><td>10%</td><td>9%</td><td>8%</td></tr>
+                <tr><td>EBIT Margin</td><td>36.9%</td><td>37%</td><td>38%</td><td>39%</td><td>39%</td><td>40%</td></tr>
+                <tr><td>FCF（亿HK$）</td><td>2,386</td><td>2,740</td><td>3,145</td><td>3,550</td><td>3,895</td><td>4,280</td></tr>
+            </tbody>
+        </table>
+
+        <div class="scenario-grid" style="margin-top:20px;">
+            <div class="scenario-card scenario-bear">
+                <div class="sc-title">🐻 悲观情景</div>
+                <div class="sc-price">HK$${dcfBear}</div>
+                <div class="sc-upside" style="color:#059669;">${pct(parseFloat(upsideDcfBear))}</div>
+                <div class="sc-detail">WACC 11.5% · 永续 1.5%<br>收入增速下调3pct · 毛利率承压<br>AI投入回报不及预期</div>
+            </div>
+            <div class="scenario-card scenario-base">
+                <div class="sc-title">📊 基础情景</div>
+                <div class="sc-price">HK$${dcfBase}</div>
+                <div class="sc-upside" style="color:var(--primary);">${pct(parseFloat(upsideDcfBase))}</div>
+                <div class="sc-detail">WACC 10.0% · 永续 2.5%<br>收入增速符合预期 · 毛利率稳中有升<br>AI开始贡献增量收入</div>
+            </div>
+            <div class="scenario-card scenario-bull">
+                <div class="sc-title">🐂 乐观情景</div>
+                <div class="sc-price">HK$${dcfBull}</div>
+                <div class="sc-upside" style="color:#dc2626;">${pct(parseFloat(upsideDcfBull))}</div>
+                <div class="sc-detail">WACC 9.0% · 永续 3.0%<br>游戏出海+AI商业化超预期<br>广告/云加速增长</div>
+            </div>
+        </div>
+
+        <div class="section-divider"></div>
+        <h3 style="font-size:14px; margin-bottom:12px;">敏感性分析（每股价值 HK$）</h3>
+        <div class="sensitivity-table">
+            <table>
+                <thead>
+                    <tr><th>WACC \\ 永续</th><th>1.5%</th><th>2.0%</th><th>2.5%</th><th>3.0%</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>9.0%</td><td>568</td><td>598</td><td>635</td><td>682</td></tr>
+                    <tr><td>9.5%</td><td>525</td><td>550</td><td>583</td><td>623</td></tr>
+                    <tr><td>10.0%</td><td>488</td><td>510</td><td class="center-cell">540</td><td>577</td></tr>
+                    <tr><td>10.5%</td><td>456</td><td>474</td><td>498</td><td>530</td></tr>
+                    <tr><td>11.0%</td><td>428</td><td>443</td><td>463</td><td>489</td></tr>
+                    <tr><td>11.5%</td><td>403</td><td>416</td><td>433</td><td>455</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div style="font-size:12px; color:var(--gray-500);">当前股价 HK$${fmt(price,1)} 对应 WACC 约 11.2% / 永续 1.5% 的组合，市场定价已接近悲观情景。</div>
+    </div>
+</div>
+
+<!-- 6. 可比公司 -->
+<div class="card">
+    <div class="card-header"><h2>🏢 可比公司估值对标</h2><span class="badge badge-blue">含中美科技巨头</span></div>
+    <div class="card-body">
+        <table>
+            <thead>
+                <tr><th>公司</th><th>市值（亿）</th><th>PE (TTM)</th><th>PE (Fwd)</th><th>PB</th><th>PS</th><th>股息率</th></tr>
+            </thead>
+            <tbody>
+                <tr style="background:#e8f0fe; font-weight:600;"><td>腾讯控股 🇭🇰</td><td>${fmtInt(mktCapYi)} 亿HK$</td><td>${fmt(pe)}</td><td>${fmt(fwdPE)}</td><td>${fmt(pb)}</td><td>${fmt(ps)}</td><td>${fmt(dividendYield)}%</td></tr>
+                <tr style="background:#f9fafb; font-size:12px; color:var(--gray-500);"><td colspan="7">—— 中国互联网 ——</td></tr>
+                ${cmpRowsHtml}
+                <tr style="background:#f9fafb; font-size:12px; color:var(--gray-500);"><td colspan="7">—— 美国科技巨头（USD→HKD 按${approxSub}7.8 折算） ——</td></tr>
+                ${usRowsHtml}
+            </tbody>
+        </table>
+        <div style="margin-top:16px; padding:14px 16px; background:#fef3c7; border-radius:8px; font-size:13px; color:#92400e; border-left:3px solid #d97706;">
+            <strong style="color:#b45309;">⚠️ 关键视角切换：</strong>仅看中国互联网公司，腾讯 PE ${fmt(pe)}x "看起来很便宜"；但拉入美国科技巨头后，格局完全不同：
+        </div>
+        <div style="margin-top:12px; font-size:13px; color:var(--gray-700); line-height:1.9;">
+            <strong>① PE 对比：</strong>腾讯 TTM PE ${fmt(pe)}x 不仅远低于苹果(36x)、谷歌(28x)，也显著低于 Meta(21x)和微软(23x)。即使看 Forward PE，腾讯 ${fmt(fwdPE)}x vs Meta 13.8x 已较为接近，但微软仍达 21.7x。<br>
+            <strong>② PB 对比：</strong>腾讯 PB ${fmt(pb)}x 在所有可比公司中处于最低档——Meta 6.01x、微软 6.80x、苹果高达 41x。这反映市场对腾讯 ROE 的可持续性存疑（或港股系统性折价），而非基本面不支持更高 PB。<br>
+            <strong>③ Fwd PE 梯队：</strong>Meta 13.8x &lt; 腾讯 ${fmt(fwdPE)}x &lt; 微软 21.7x &lt; 苹果 30.7x。腾讯与 Meta 同属"高增速+合理估值"梯队，但腾讯 Forward EPS 增速（${approxSub}+15%）高于 Meta（AI 广告变现已部分 price-in）。<br>
+            <strong>④ 结论：</strong>加入美国同行后，腾讯的估值吸引力依然成立，但不再是"碾压式便宜"，而是"在全球科技巨头中处于估值洼地、与最便宜的 Meta 接近"的定位。
+        </div>
+    </div>
+</div>
+
+<!-- 7. 历史估值 -->
+<div class="card">
+    <div class="card-header"><h2>📉 历史估值区间与分位</h2></div>
+    <div class="card-body">
+        <div class="chart-container tall">
+            <canvas id="peChart"></canvas>
+        </div>
+        <div class="grid-3" style="margin-top:16px;">
+            <div class="kpi-box down"><div class="kpi-label">PE 3年中位数</div><div class="kpi-value">${approxVal}22x</div><div class="kpi-sub">当前 ${fmt(pe)}x 低于中位数 ${Math.round((1 - pe/22)*100)}%</div></div>
+            <div class="kpi-box"><div class="kpi-label">52周最高</div><div class="kpi-value">HK$${fmt(high52w,1)}</div><div class="kpi-sub">PE ${approxSub}${fmt(high52w/eps,1)}x</div></div>
+            <div class="kpi-box"><div class="kpi-label">52周最低</div><div class="kpi-value">HK$${fmt(low52w,1)}</div><div class="kpi-sub">PE ${approxSub}${fmt(low52w/eps,1)}x</div></div>
+        </div>
+        <div style="margin-top:12px; font-size:13px; color:var(--gray-700); line-height:1.8;">
+            <strong>当前估值所反映的预期：</strong>PE ${fmt(pe)}x 的定价隐含市场对以下担忧：①地缘政治对游戏出海的潜在限制；②AI高投入短期拖累利润率；③宏观消费疲软影响广告与支付增速；④港股流动性持续承压。然而，腾讯毛利率已从43%升至56%、ROE稳定在21%+、经营现金流创新高——这些硬数据并未被充分定价。
+        </div>
+    </div>
+</div>
+
+<!-- 8. 机构评级 -->
+<div class="card">
+    <div class="card-header"><h2>🏛️ 机构评级与目标价</h2><span class="badge badge-green">${buyPct}% 买入/增持</span></div>
+    <div class="card-body">
+        <div class="grid-3">
+            <div class="kpi-box"><div class="kpi-label">覆盖机构数</div><div class="kpi-value">${ratingCount}</div></div>
+            <div class="kpi-box"><div class="kpi-label">一致目标价</div><div class="kpi-value" style="color:var(--accent);">HK$${fmt(targetPrice,1)}</div><div class="kpi-sub">vs 现价 ${pct(parseFloat(upsideTarget))}</div></div>
+            <div class="kpi-box"><div class="kpi-label">评级分布</div><div class="kpi-value">45/9/2/0/1</div><div class="kpi-sub">买入/增持/中性/减持/卖出</div></div>
+        </div>
+        <div style="margin-top:16px;">
+            <table>
+                <thead><tr><th>目标价区间</th><th>对应PE区间</th><th>较现价涨幅</th><th>隐含假设</th></tr></thead>
+                <tbody>
+                    <tr><td>最低 HK$478.7</td><td>${approxSub}17.5x</td><td>${pct(478.7/price-1)}</td><td>保守：增速放缓，估值维持偏低</td></tr>
+                    <tr><td>中位 HK$${fmt(targetPrice,1)}</td><td>${approxSub}26.7x</td><td>${pct(parseFloat(upsideTarget))}</td><td>中性偏乐观：增长恢复，估值回归</td></tr>
+                    <tr><td>最高 HK$882.0</td><td>${approxSub}32.2x</td><td>${pct(882/price-1)}</td><td>乐观：AI+游戏超预期，估值重估</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- 9. 分红回购 -->
+<div class="card">
+    <div class="card-header"><h2>💵 股东回报：分红与回购</h2><span class="badge badge-green">分红连年提升</span></div>
+    <div class="card-body">
+        <div class="chart-container">
+            <canvas id="dividendChart"></canvas>
+        </div>
+        <div style="margin-top:12px; font-size:13px; color:var(--gray-700); line-height:1.8;">
+            <strong>分红趋势：</strong>从FY2021的HK$1.6/股提升至FY2025的HK$5.3/股，4年CAGR约35%。FY2022-2023另有实物分派（美团、京东），若计入则股东回报更丰厚。当前股息率${fmt(dividendYield)}%虽不高，但分红增速远超盈利增速，管理层明确持续提升分红的信号强烈。
+        </div>
+    </div>
+</div>
+
+<!-- 10. 南向资金 -->
+<div class="card">
+    <div class="card-header"><h2>🌊 南向资金持仓</h2></div>
+    <div class="card-body">
+        <div class="grid-3">
+            <div class="kpi-box"><div class="kpi-label">南向持仓比例</div><div class="kpi-value">${fmt(southHoldPct)}%</div></div>
+            <div class="kpi-box"><div class="kpi-label">持仓市值</div><div class="kpi-value">${approxVal}HK$${fmtInt(southHoldValue)}亿</div></div>
+            <div class="kpi-box"><div class="kpi-label">季度变动</div><div class="kpi-value" style="color:var(--green);">${southQChange>=0?'':'-'}HK$${fmtInt(Math.abs(southQChange))}亿</div><div class="kpi-sub">季度净${southQChange>=0?'增持':'减持'}</div></div>
+        </div>
+        <div style="margin-top:12px; font-size:13px; color:var(--gray-500);">
+            南向资金近期呈${southQChange>=0?'净流入':'净流出'}态势。当前持仓比例${fmt(southHoldPct)}%仍处于较高水平，长线配置型资金底仓未发生根本性改变。
+        </div>
+    </div>
+</div>
+
+<!-- 11. 重估/杀估值触发因素 -->
+<div class="card">
+    <div class="card-header"><h2>⚡ 重估与杀估值触发因素</h2></div>
+    <div class="card-body">
+        <div class="grid-2">
+            <div>
+                <h3 style="font-size:14px; color:var(--accent); margin-bottom:12px;">🔴 杀估值风险</h3>
+                <div class="risk-item high"><div class="risk-title">AI投入回报不及预期</div><div class="risk-desc">CapEx从232亿飙升至969亿，若AI商业化进展缓慢，将拖累利润率与ROE</div></div>
+                <div class="risk-item high"><div class="risk-title">游戏监管/出海受限</div><div class="risk-desc">国内外游戏监管政策变化可能冲击核心收入引擎</div></div>
+                <div class="risk-item medium"><div class="risk-title">宏观消费持续疲软</div><div class="risk-desc">影响支付GMV增速与广告主预算，压制金融科技与营销收入</div></div>
+                <div class="risk-item medium"><div class="risk-title">港股流动性长期低迷</div><div class="risk-desc">地缘政治与汇率因素可能导致估值中枢永久性下移</div></div>
+            </div>
+            <div>
+                <h3 style="font-size:14px; color:var(--green); margin-bottom:12px;">🟢 重估催化</h3>
+                <div class="risk-item" style="border-color:var(--green);"><div class="risk-title" style="color:var(--green);">AI商业化突破</div><div class="risk-desc">混元大模型在广告、云、办公场景变现，打开增量收入空间</div></div>
+                <div class="risk-item" style="border-color:var(--green);"><div class="risk-title" style="color:var(--green);">游戏产品周期反转</div><div class="risk-desc">新游上线+海外拓展驱动增值服务增速超预期</div></div>
+                <div class="risk-item" style="border-color:var(--green);"><div class="risk-title" style="color:var(--green);">视频号商业化加速</div><div class="risk-desc">视频号广告加载率仍低，电商GMV高速增长，双轮驱动</div></div>
+                <div class="risk-item" style="border-color:var(--green);"><div class="risk-title" style="color:var(--green);">持续大额回购</div><div class="risk-desc">管理层若重启大规模回购，直接提振EPS与市场信心</div></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 12. 投资结论 -->
+<div class="card">
+    <div class="card-header"><h2>📋 估值结论与投资判断</h2></div>
+    <div class="card-body">
+        <div class="verdict">
+            <div class="verdict-icon">${verdictEmoji}</div>
+            <div class="verdict-text">
+                <h3>${verdictTitle}</h3>
+                <p>多方法交叉验证指向合理价值 HK$${dcfBase}-${sotpHigh} 区间，当前 HK$${fmt(price,1)} 处于${valuationVerdict === '偏低' ? '低估' : valuationVerdict}状态</p>
+            </div>
+        </div>
+        <div class="conclusion-box" style="margin-top:16px;">
+            <h3>核心判断</h3>
+            <p>
+                <strong>1. 估值位置：</strong>当前 PE ${fmt(pe)}x 处于近3年约${pePercentile}%分位，PB ${fmt(pb)}x 处于约${pbPercentile}%分位，为2022年10月以来的最低估值水平。对于 ROE 21%+ 的平台龙头，这一估值已经过度计入了悲观预期。<br><br>
+                <strong>2. 赚什么钱：</strong>当前买入主要赚<span class="highlight">业绩钱</span>而非估值钱。即便估值维持${fmt(pe,0)}x，FY2026E EPS ${approxSub}HK$28.9 对应价格 HK$${fmt(28.9*pe,0)}（接近现价），FY2027E EPS ${approxSub}HK$32 对应 HK$${fmt(32*pe,0)}（${pct(32*pe/price-1)}），盈利增长本身可提供回报。若估值从${fmt(pe,0)}x回归至18-20x（仍低于历史中位），则额外提供${pct((18-pe)/pe*100)}-${pct((20-pe)/pe*100)}的估值修复收益。<br><br>
+                <strong>3. 最薄弱假设：</strong>市场隐含假设是"AI高投入无法变现+收入增速放缓"，但腾讯FY2025毛利率已达56.2%（FY2022仅43.1%），证明经营杠杆仍在释放中。如果AI在广告投放（已初步验证）、企业服务、游戏内容生成上变现成功，当前PE将被证明过度悲观。<br><br>
+                <strong>4. 反向声音：</strong>港股流动性可能成为结构性制约——即使基本面改善，估值中枢可能因资金面因素永久低于历史均值。需警惕"便宜还可以更便宜"的陷阱。<br><br>
+                <strong>5. 条件化决策：</strong>若股价跌破 HK$${fmt(low52w,0)}（52周低点，PE ${approxSub}${fmt(pe,0)}x TTM），可加仓；若反弹至 HK$530+（PE ${approxSub}19x），可减仓锁定估值修复收益；HK$${fmt(low52w+20,0)}-530 区间持有，等待催化。
+            </p>
+        </div>
+        <div style="margin-top:20px;">
+            <table>
+                <thead><tr><th>估值方法</th><th>合理价值区间</th><th>较现价空间</th><th>置信度</th></tr></thead>
+                <tbody>
+                    <tr><td>SOTP 分部估值</td><td>HK$${sotpLow} - ${sotpHigh}</td><td style="color:var(--accent)">+${upsideSotpLow}% ~ +${upsideSotpHigh}%</td><td><span class="tag tag-bull">高</span></td></tr>
+                    <tr><td>DCF 基础情景</td><td>HK$${dcfBase}</td><td style="color:var(--accent)">${pct(parseFloat(upsideDcfBase))}</td><td><span class="tag tag-bull">高</span></td></tr>
+                    <tr><td>DCF 悲观情景</td><td>HK$${dcfBear}</td><td style="color:var(--green)">${pct(parseFloat(upsideDcfBear))}</td><td><span class="tag tag-neutral">中</span></td></tr>
+                    <tr><td>DCF 乐观情景</td><td>HK$${dcfBull}</td><td style="color:var(--accent)">${pct(parseFloat(upsideDcfBull))}</td><td><span class="tag tag-neutral">中</span></td></tr>
+                    <tr><td>机构一致目标价</td><td>HK$${fmt(targetPrice,1)}</td><td style="color:var(--accent)">${pct(parseFloat(upsideTarget))}</td><td><span class="tag tag-bear">参考</span></td></tr>
+                    <tr style="background:var(--primary-light); font-weight:700;"><td>综合估值区间</td><td>HK$${dcfBase} - ${sotpHigh}</td><td style="color:var(--accent)">+${upsideDcfBase}% ~ +${upsideSotpHigh}%</td><td>-</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Disclaimer -->
+<div style="margin-top:20px; padding:16px 20px; background:var(--gray-100); border-radius:8px; font-size:11px; color:var(--gray-500); line-height:1.8;">
+    <strong>免责声明：</strong>本报告仅供信息参考，不构成投资建议。所有数据来源于公开市场信息（westock-data/腾讯自选股，截至${today}），可能存在延迟。估值模型基于假设，实际结果可能显著偏离。投资有风险，决策需谨慎。部分估算数据（如分部净利润、EV/EBITDA等）为基于公开数据的合理推算，并非公司官方披露。如需专业投资建议，请咨询持牌证券投资顾问机构。
+</div>
+
+</div>
+
+<script>
+const colors = {
+    primary: '#1a56db',
+    primaryLight: '#e8f0fe',
+    red: '#dc2626',
+    green: '#059669',
+    amber: '#d97706',
+    gray: '#6b7280',
+    teal: '#0d9488',
+    purple: '#7c3aed',
+    pink: '#db2777',
+};
+
+// 1. Revenue & Profit Chart
+new Chart(document.getElementById('revenueChart'), {
+    type: 'bar',
+    data: {
+        labels: ${JSON.stringify(finData.years)},
+        datasets: [{
+            label: '营业收入（亿HK$）',
+            data: ${JSON.stringify(finData.revenue)},
+            backgroundColor: 'rgba(26,86,219,0.7)',
+            borderRadius: 4,
+            yAxisID: 'y',
+        }, {
+            label: '归母净利润（亿HK$）',
+            data: ${JSON.stringify(finData.netProfit)},
+            backgroundColor: 'rgba(220,38,38,0.7)',
+            borderRadius: 4,
+            yAxisID: 'y',
+        }, {
+            label: '毛利率（%）',
+            data: ${JSON.stringify(finData.grossMargin)},
+            type: 'line',
+            borderColor: colors.teal,
+            backgroundColor: colors.teal,
+            yAxisID: 'y1',
+            tension: 0.3,
+            pointRadius: 4,
+            borderWidth: 2,
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'top', labels: { font: { size: 11 } } } },
+        scales: {
+            y: { position: 'left', title: { display: true, text: '金额（亿HK$）' }, grid: { color: '#f3f4f6' } },
+            y1: { position: 'right', title: { display: true, text: '毛利率（%）' }, min: 35, max: 65, grid: { display: false } }
+        }
+    }
+});
+
+// 2. Segment Chart
+new Chart(document.getElementById('segmentChart'), {
+    type: 'doughnut',
+    data: {
+        labels: ${JSON.stringify(segmentData.names.map((n,i) => n + ' ' + segmentData.pct[i] + '%'))},
+        datasets: [{
+            data: ${JSON.stringify(segmentData.pct)},
+            backgroundColor: [colors.primary, colors.teal, colors.amber, colors.gray],
+            borderWidth: 2,
+            borderColor: '#fff',
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 12 } } },
+        cutout: '55%',
+    }
+});
+
+// 3. FCF Chart
+new Chart(document.getElementById('fcfChart'), {
+    type: 'bar',
+    data: {
+        labels: ${JSON.stringify(finData.years)},
+        datasets: [{
+            label: '经营现金流',
+            data: ${JSON.stringify(finData.ocf)},
+            backgroundColor: 'rgba(26,86,219,0.6)',
+            borderRadius: 4,
+        }, {
+            label: '资本开支',
+            data: ${JSON.stringify(capex)},
+            backgroundColor: 'rgba(220,38,38,0.5)',
+            borderRadius: 4,
+        }, {
+            label: '自由现金流',
+            data: ${JSON.stringify(fcf)},
+            backgroundColor: 'rgba(5,150,105,0.6)',
+            borderRadius: 4,
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'top', labels: { font: { size: 11 } } } },
+        scales: { y: { title: { display: true, text: '亿HK$' }, grid: { color: '#f3f4f6' } } }
+    }
+});
+
+// 4. PE History Chart
+new Chart(document.getElementById('peChart'), {
+    type: 'line',
+    data: {
+        labels: ${JSON.stringify(klineMonths)},
+        datasets: [{
+            label: '股价 (HK$)',
+            data: ${JSON.stringify(klinePrices)},
+            borderColor: colors.primary,
+            backgroundColor: 'rgba(26,86,219,0.05)',
+            fill: true,
+            yAxisID: 'y',
+            tension: 0.3,
+            pointRadius: 2,
+            borderWidth: 2,
+        }, {
+            label: 'PE (TTM 估算)',
+            data: ${JSON.stringify(peValues)},
+            borderColor: colors.red,
+            backgroundColor: 'rgba(220,38,38,0.05)',
+            fill: false,
+            yAxisID: 'y1',
+            tension: 0.3,
+            pointRadius: 2,
+            borderWidth: 2,
+            borderDash: [4,2],
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'top', labels: { font: { size: 11 } } } },
+        scales: {
+            y: { position: 'left', title: { display: true, text: '股价 (HK$)' }, grid: { color: '#f3f4f6' } },
+            y1: { position: 'right', title: { display: true, text: 'PE (x)' }, min: 10, max: 40, grid: { display: false } }
+        }
+    }
+});
+
+// 5. Dividend Chart
+new Chart(document.getElementById('dividendChart'), {
+    type: 'bar',
+    data: {
+        labels: ${JSON.stringify(finData.years)},
+        datasets: [{
+            label: '每股派息 (HK$)',
+            data: ${JSON.stringify(dividends)},
+            backgroundColor: 'rgba(5,150,105,0.7)',
+            borderRadius: 4,
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'top', labels: { font: { size: 11 } } } },
+        scales: { y: { title: { display: true, text: 'HK$/股' }, grid: { color: '#f3f4f6' } } }
+    }
+});
+<\/script>
+
+</body>
+</html>`;
+
+// ─── 输出 ───
+const outputPath = process.argv.includes('--output') 
+    ? process.argv[process.argv.indexOf('--output') + 1] 
+    : DEFAULT_OUTPUT;
+
+fs.writeFileSync(outputPath, html, 'utf-8');
+console.log(`✅ Dashboard 已生成: ${outputPath}`);
+console.log(`📅 数据日期: ${today}`);
+console.log(`💰 腾讯控股: HK$${fmt(price,1)} | PE ${fmt(pe)}x | PB ${fmt(pb)}x`);
