@@ -14,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 
 // ─── 配置 ───
-const WESTOCK = '/Users/patzhai/.workbuddy/binaries/node/versions/22.22.2/bin/node /Users/patzhai/.workbuddy/plugins/marketplaces/cb_teams_marketplace/plugins/finance-data/skills/westock-data/scripts/index.js';
+const WESTOCK = '/Users/patzhai/.workbuddy/binaries/node/versions/22.22.2/bin/node /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/westock-data/scripts/index.js';
 const DEFAULT_OUTPUT = path.join(__dirname, 'index.html');
 
 // 中国10年期国债收益率（手动维护，季度更新）
@@ -96,9 +96,11 @@ const tencentQuote = runWestock('quote hk00700');
 const cmpQuotes = runWestock('quote hk09988,hk09618,hk03690,hk01024');
 const usQuotes = runWestock('quote usMETA,usMSFT,usGOOGL,usAAPL');
 const klineData = runWestock('kline hk00700 --period day --limit 120');
-const dividendData = runWestock('dividend hk00700 --years 5');
+const dividendData = runWestock('dividend list hk00700 --years 5');
 const ratingData = runWestock('rating hk00700');
-const hkfundData = runWestock('hkfund hk00700');
+// hkfund 命令在当前 westock-data CLI 中不存在，南向资金使用 fallback 数据
+// const hkfundData = runWestock('hkfund hk00700');
+const hkfundData = [];
 
 // ─── 解析腾讯行情 ───
 console.log('🔄 解析数据...');
